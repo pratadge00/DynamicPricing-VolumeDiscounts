@@ -1,0 +1,268 @@
+import numpyro
+import numpyro.distributions as dist
+import jax.numpy as jnp
+import numpy as np
+import pandas as pd
+from jax import random, vmap
+from numpyro.infer import MCMC, NUTS, Predictive
+import warnings
+warnings.filterwarnings("ignore")
+
+
+class DynamicPricingOptimizerImproved:
+    def __init__(self, price_range, batch_size=1000, num_iterations=10, num_ts_samples=100):
+        self.price_range = jnp.array(price_range)
+        self.batch_size = batch_size
+        self.num_iterations = num_iterations
+        self.num_ts_samples = num_ts_samples
+        self.rng_key = random.PRNGKey(0)
+
+    def demand_model(self, price, time, day_of_week, quantity=None):
+        """
+        Enhanced Bayesian Linear Regression Model with stronger monotonicity constraints and expanded basis functions.
+        """
+        # Enhanced price-related basis functions
+        theta_price = numpyro.sample(
+            "theta_price",
+            dist.LogNormal(0.0, 0.5).expand([7])  # Expanded number of price features
+        )
+        price_basis = jnp.stack([
+            -jnp.log(price + 1e-5),              # Logarithmic decay
+            -jnp.log(price + 1e-5) ** 2 / 10,   # Quadratic logarithmic decay
+            -jnp.exp(-price / 50),              # Exponential decay
+            -jnp.sqrt(price + 1e-5),            # Square root decay
+            -1 / (price + 1e-5),                # Inverse price term
+            -price / 100,                       # Linear decay
+            -price ** 2 / 1000                  # Quadratic decay
+        ], axis=-1)
+
+        # Enhanced time-related basis functions
+        theta_time = numpyro.sample(
+            "theta_time",
+            dist.Normal(0.0, 0.5).expand([4])
+        )
+        time_basis = jnp.stack([
+            jnp.cos(2 * jnp.pi * time / 365),   # Annual seasonality
+            jnp.sin(2 * jnp.pi * time / 365),   # Annual sinusoidal trend
+            jnp.cos(2 * jnp.pi * time / 7),     # Weekly seasonality
+            jnp.sin(2 * jnp.pi * time / 7)      # Weekly sinusoidal trend
+        ], axis=-1)
+
+        # Day-of-week effects
+        theta_dow = numpyro.sample(
+            "theta_dow",
+            dist.Normal(0.0, 0.5).expand([7])
+        )
+        dow_basis = jnp.eye(7)[day_of_week.astype(int)]  # One-hot encoding for day of week
+
+        # Interaction terms
+        interaction_basis = jnp.concatenate([
+            price_basis * jnp.expand_dims(time_basis[:, 0], axis=1),  # Price x Annual seasonality
+            price_basis * jnp.expand_dims(time_basis[:, 2], axis=1)   # Price x Weekly seasonality
+        ], axis=-1)
+        theta_interaction = numpyro.sample(
+            "theta_interaction",
+            dist.LogNormal(0.0, 0.5).expand([interaction_basis.shape[-1]])
+        )
+
+        # Combine all features
+        combined_basis = jnp.concatenate([price_basis, time_basis, dow_basis, interaction_basis], axis=-1)
+        theta_combined = jnp.concatenate([theta_price, theta_time, theta_dow, theta_interaction])
+
+        # Calculate demand prediction
+        demand_pred = jnp.dot(combined_basis, theta_combined)
+
+        # Strong monotonicity constraint
+        with numpyro.plate("monotonic", len(price) - 1):
+            numpyro.factor(
+                "monotonic_constraint",
+                -1000.0 * jnp.maximum(0, jnp.diff(demand_pred))
+            )
+
+        # Add noise term
+        sigma = numpyro.sample("sigma", dist.Exponential(0.05))
+
+        # Sample observations
+        with numpyro.plate("data", len(price)):
+            numpyro.sample(
+                "obs",
+                dist.Normal(demand_pred, sigma),
+                obs=quantity
+            )
+
+    def fit_model(self, prices, times, day_of_weeks, volumes):
+        """
+        Fit the Bayesian model using NUTS sampler
+        """
+        self.rng_key, subkey = random.split(self.rng_key)
+
+        kernel = NUTS(self.demand_model)
+        mcmc = MCMC(kernel, num_warmup=2000, num_samples=4000)  # Increased sampling for stability
+        mcmc.run(
+            subkey,
+            price=jnp.array(prices),
+            time=jnp.array(times),
+            day_of_week=jnp.array(day_of_weeks),
+            quantity=jnp.array(volumes)
+        )
+        return mcmc.get_samples()
+
+    def thompson_sampling(self, posterior_samples, time, day_of_week, cost):
+        """
+        Improved Thompson Sampling with stronger exploration incentives.
+        """
+        self.rng_key, subkey = random.split(self.rng_key)
+
+        # Predictive model
+        predictive = Predictive(self.demand_model, posterior_samples)
+
+        demands = []
+        profits = []
+
+        for _ in range(self.num_ts_samples):
+            self.rng_key, subkey = random.split(self.rng_key)
+
+            predicted = predictive(
+                subkey,
+                price=self.price_range,
+                time=jnp.full_like(self.price_range, time),
+                day_of_week=jnp.full_like(self.price_range, day_of_week)
+            )
+
+            demand = predicted['obs'].mean(axis=0)
+            profit = (self.price_range - cost) * demand
+
+            demands.append(demand)
+            profits.append(profit)
+
+        # Use exploration bonus
+        median_profits = jnp.median(jnp.stack(profits), axis=0)
+        optimal_idx = jnp.argmax(median_profits)
+        return self.price_range[optimal_idx], demands, profits
+
+    def optimize(self, df, cost):
+        """
+        Main optimization loop with improved monotonicity and basis functions.
+        """
+        df = df.copy()
+        df['total_volume'] = df.groupby('date')['quantity'].transform('sum')
+        df['average_price'] = df.groupby('date')['price_paid'].transform('mean')
+
+        dates = df['date'].unique()
+        prices = df.groupby('date')['average_price'].first().values
+        volumes = df.groupby('date')['total_volume'].first().values
+        day_of_weeks = df.groupby('date')['day_of_week'].first().values
+
+        all_prices, all_volumes, all_times, all_day_of_weeks, optimal_prices = [], [], [], [], []
+
+        for i in range(min(self.num_iterations, len(dates) // self.batch_size)):
+            print(f"Iteration {i + 1}/{self.num_iterations}")
+
+            start_idx, end_idx = i * self.batch_size, (i + 1) * self.batch_size
+            all_prices.extend(prices[start_idx:end_idx])
+            all_volumes.extend(volumes[start_idx:end_idx])
+            all_times.extend(range(start_idx, end_idx))
+            all_day_of_weeks.extend(day_of_weeks[start_idx:end_idx])
+
+            posterior_samples = self.fit_model(all_prices, all_times, all_day_of_weeks, all_volumes)
+
+            optimal_price, demands, profits = self.thompson_sampling(
+                posterior_samples,
+                time=max(all_times) + 1,
+                day_of_week=all_day_of_weeks[-1],
+                cost=cost
+            )
+
+            optimal_prices.append(float(optimal_price))
+            print(f"Optimal price for next period: {optimal_price:.2f}")
+
+        return {
+            'optimal_prices': optimal_prices,
+            'final_posterior': posterior_samples,
+            'price_range': self.price_range,
+            'last_demands': demands,
+            'last_profits': profits
+        }
+
+
+# Example usage
+if __name__ == "__main__":
+    file_path = r"Your_Path"
+    df = pd.read_csv(file_path)
+    df['date'] = pd.to_datetime(df['date'])
+
+    price_range = np.linspace(100, 500, 100)
+    cost = df['cost'].mean()
+
+    optimizer = DynamicPricingOptimizerImproved(price_range=price_range, batch_size=1000, num_iterations=10, num_ts_samples=100)
+    results = optimizer.optimize(df, cost)
+
+    print("\nOptimization Results:")
+    print(f"Final optimal price: {results['optimal_prices'][-1]:.2f}")
+    for i, price in enumerate(results['optimal_prices']):
+        print(f"Iteration {i + 1}: {price:.2f}")
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+def visualize_results(price_range, results, df, cost):
+    """
+    Visualize the results from the dynamic pricing optimization process.
+    """
+    # Unpack results
+    optimal_prices = results['optimal_prices']
+    last_demands = results['last_demands'][-1]
+    last_profits = results['last_profits'][-1]
+
+    # Scatter plot of historical prices and volumes
+    plt.figure(figsize=(15, 10))
+
+    # Plot 1: Historical data and demand curve
+    plt.subplot(2, 2, 1)
+    sns.scatterplot(data=df, x='price_paid', y='quantity', alpha=0.6, label="Historical Data")
+    plt.plot(price_range, last_demands, label="Predicted Demand Curve", color="blue")
+    plt.axvline(optimal_prices[-1], color="green", linestyle="--", label=f"Optimal Price: {optimal_prices[-1]:.2f}")
+    plt.title("Demand Curve for Final Iteration")
+    plt.xlabel("Price")
+    plt.ylabel("Quantity Sold")
+    plt.legend()
+    plt.grid(True)
+
+    # Plot 2: Profit curve
+    plt.subplot(2, 2, 2)
+    plt.plot(price_range, last_profits, label="Profit Curve", color="purple")
+    plt.axvline(optimal_prices[-1], color="green", linestyle="--", label=f"Optimal Price: {optimal_prices[-1]:.2f}")
+    plt.title("Profit Curve for Final Iteration")
+    plt.xlabel("Price")
+    plt.ylabel("Profit")
+    plt.legend()
+    plt.grid(True)
+
+    # Plot 3: Optimal prices over iterations
+    plt.subplot(2, 2, 3)
+    plt.plot(optimal_prices, marker="o", label="Optimal Prices", color="orange")
+    plt.title("Optimal Prices Over Iterations")
+    plt.xlabel("Iteration")
+    plt.ylabel("Optimal Price")
+    plt.legend()
+    plt.grid(True)
+
+    # Plot 4: Volume sold over time
+    plt.subplot(2, 2, 4)
+    df['date'] = pd.to_datetime(df['date'])
+    daily_volumes = df.groupby('date')['quantity'].sum()
+    daily_volumes.plot(label="Daily Volume Sold", color="cyan")
+    plt.title("Volume Sold Over Time")
+    plt.xlabel("Date")
+    plt.ylabel("Volume Sold")
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
+visualize_results(price_range, results, df, cost)
+
