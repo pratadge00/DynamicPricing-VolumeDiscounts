@@ -1,0 +1,81 @@
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
+# Parameters for Gaussian distributions
+mean_1, std_dev_1 = 200, 30
+mean_2, std_dev_2 = 300, 50
+proportion_1, proportion_2 = 0.3, 0.7
+
+# Demand function parameters
+a, b = 100, 0.005  # Controls the scale and decay rate of quantity with price
+
+# Total number of samples and unique customers to generate
+num_samples = 10000
+num_customers = 6000  # Simulating infrequent buying
+
+# Calculate number of samples per price distribution
+num_samples_1 = int(proportion_1 * num_samples)
+num_samples_2 = num_samples - num_samples_1
+
+# Generate price data
+prices_1 = np.random.normal(mean_1, std_dev_1, num_samples_1)
+prices_2 = np.random.normal(mean_2, std_dev_2, num_samples_2)
+prices = np.concatenate([prices_1, prices_2])
+
+# Generate random dates within the past year
+dates = [datetime.now() - timedelta(days=np.random.randint(0, 365)) for _ in range(num_samples)]
+
+# Add seasonality indicators
+day_of_year = np.array([date.timetuple().tm_yday for date in dates])  # Annual seasonality
+day_of_week = np.array([date.weekday() for date in dates])  # Weekly seasonality
+
+# Generate base quantities without seasonality
+quantities = np.maximum(a * np.exp(-b * prices) + np.random.normal(0, 2, num_samples), 1).astype(int)
+
+# Introduce annual seasonality (e.g., peak in mid-year and around year-end)
+annual_seasonal_factor = 1 + 0.3 * np.cos(2 * np.pi * (day_of_year / 365))
+
+# Introduce weekly seasonality (e.g., higher demand on weekends)
+weekly_seasonal_factor = 1 + 0.2 * np.cos(2 * np.pi * (day_of_week / 7))
+
+# Apply both seasonality adjustments to the quantities
+quantities = (quantities * annual_seasonal_factor * weekly_seasonal_factor).astype(int)
+
+# Set a fixed product ID for all entries (single product)
+product_id = 52
+
+# Generate other fields
+costs = prices * np.random.uniform(0.6, 0.8, num_samples)
+
+# Generate 6000 unique customer IDs and assign them to transactions
+customers = np.random.choice(range(num_customers), num_samples, replace=True)
+
+# Calculate transaction count per customer
+transaction_counts = pd.Series(customers).value_counts().to_dict()  # Count transactions per customer ID
+transaction_count_column = [transaction_counts[customer_id] for customer_id in customers]  # Lookup each customer’s count
+
+# Create the dataset
+data = {
+    'product_id': product_id,
+    'date': dates,
+    'customer_id': customers,
+    'quantity': quantities,
+    'price_paid': prices,
+    'base_price': prices,
+    'cost': costs,
+    'transaction_count': transaction_count_column,
+    'day_of_year': day_of_year,  # Retain annual seasonality indicator
+    'day_of_week': day_of_week  # Retain weekly seasonality indicator
+}
+
+# Convert to DataFrame and sort by date
+df = pd.DataFrame(data)
+df.sort_values(by='date', inplace=True)
+
+# Save to CSV
+output_file_path = r'Your Path'
+df.to_csv(output_file_path, index=False)
+
+# Display a sample of the dataset
+print(df.head(10))
